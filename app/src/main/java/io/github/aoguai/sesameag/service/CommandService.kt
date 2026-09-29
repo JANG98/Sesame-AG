@@ -7,7 +7,9 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.os.Binder
 import android.os.IBinder
+import android.os.Process
 import android.os.RemoteCallbackList
 import android.os.RemoteException
 import androidx.core.app.NotificationCompat
@@ -17,6 +19,7 @@ import io.github.aoguai.sesameag.IStatusListener
 import io.github.aoguai.sesameag.R
 import io.github.aoguai.sesameag.data.Config
 import io.github.aoguai.sesameag.data.General
+import io.github.aoguai.sesameag.hook.keepalive.SystemWakeScheduler
 import io.github.aoguai.sesameag.ui.MainActivity
 import io.github.aoguai.sesameag.util.Log
 import io.github.aoguai.sesameag.util.PermissionUtil
@@ -80,6 +83,10 @@ class CommandService : Service() {
                             }
 
                             if (shellManager?.selectedName == "no_executor") {
+                                if (command == io.github.aoguai.sesameag.util.CommandUtil.DIAGNOSTIC_LOGCAT_COMMAND) {
+                                    safeCallbackError(callback, "executor_unavailable")
+                                    return@withLock
+                                }
                                 val refreshedType = shellManager?.refreshSelection(notifyUnavailable = false)
                                 if (refreshedType == "no_executor") {
                                     dispatchStatusChange("no_executor")
@@ -90,14 +97,29 @@ class CommandService : Service() {
 
                             // 执行
                             val result = withTimeout(COMMAND_TIMEOUT_MS) {
-                                shellManager!!.exec(command)
+                                shellManager!!.exec(
+                                    command,
+                                    refreshExecutor = command != io.github.aoguai.sesameag.util.CommandUtil.DIAGNOSTIC_LOGCAT_COMMAND,
+                                )
                             }
 
                             if (result.isSuccess) {
-                                safeCallbackSuccess(callback, result.stdout.trim())
+                                val output = if (command == io.github.aoguai.sesameag.util.CommandUtil.DIAGNOSTIC_LOGCAT_COMMAND) {
+                                    val bytes = result.stdout.toByteArray(Charsets.UTF_8)
+                                    if (bytes.size > 256 * 1024) {
+                                        bytes.copyOf(256 * 1024 - 64).toString(Charsets.UTF_8)
+                                            .substringBeforeLast('\n') + "\n[diagnostic_output_truncated]"
+                                    } else result.stdout
+                                } else result.stdout
+                                safeCallbackSuccess(callback, output.trim())
                             } else {
                                 // 优化错误信息返回，区分是 Shell 找不到还是命令执行错
-                                val errorMsg = if (result.exitCode == -1 && result.stderr.contains("No valid")) {
+                                val errorMsg = if (
+                                    command == io.github.aoguai.sesameag.util.CommandUtil.DIAGNOSTIC_LOGCAT_COMMAND &&
+                                    result.stderr.contains("Permission denied", ignoreCase = true)
+                                ) {
+                                    "permission_denied"
+                                } else if (result.exitCode == -1 && result.stderr.contains("No valid")) {
                                     "无 Root/Shizuku 权限"
                                 } else {
                                     "Code:${result.exitCode}, Err:${result.stderr}"
@@ -107,7 +129,8 @@ class CommandService : Service() {
                         } catch (e: Exception) {
                             // ... 异常处理 ...
                             Log.e(TAG, "执行异常", e)
-                            safeCallbackError(callback, e.message ?: "Service Error")
+                            safeCallbackError(callback,
+                                if (e is kotlinx.coroutines.TimeoutCancellationException) "timeout" else e.message ?: "Service Error")
                         }
                     }
                 } finally {
@@ -152,6 +175,22 @@ class CommandService : Service() {
             listeners.unregister(listener)
         }
 
+        override fun getPersistentScheduleAlarmIntent(lane: Int): PendingIntent {
+            val callerUid = Binder.getCallingUid()
+            @Suppress("DEPRECATION")
+            val targetUid = runCatching { packageManager.getPackageUid(General.PACKAGE_NAME, 0) }.getOrNull()
+            if (callerUid != Process.myUid() && callerUid != targetUid) {
+                throw SecurityException("Untrusted persistent schedule caller")
+            }
+            require(lane == SystemWakeScheduler.LANE_EXACT || lane == SystemWakeScheduler.LANE_FLEXIBLE)
+            val identity = Binder.clearCallingIdentity()
+            return try {
+                SystemWakeScheduler.createAlarmIntent(this@CommandService, lane)
+            } finally {
+                Binder.restoreCallingIdentity(identity)
+            }
+        }
+
         override fun isExecutionAllowed(userId: String?): Boolean {
             val activeUserId = userId?.trim()?.takeIf { it.isNotEmpty() } ?: return false
             val manager = shellManager ?: return false
@@ -192,6 +231,7 @@ class CommandService : Service() {
      * 分发状态给所有客户端
      */
     private fun dispatchStatusChange(type: String) {
+        io.github.aoguai.sesameag.util.ModuleDiagnostics.event("executor_selection", "changed", "type=$type")
         val count = listeners.beginBroadcast()
         for (i in 0 until count) {
             try {
@@ -205,6 +245,7 @@ class CommandService : Service() {
 
     override fun onBind(intent: Intent?): IBinder {
         Log.d(TAG, "CommandService onBind")
+        io.github.aoguai.sesameag.util.ModuleDiagnostics.event("command_service", "bound", "action=${intent?.action}")
         stopWhenIdle = false
         return binder
     }

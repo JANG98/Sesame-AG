@@ -6,12 +6,21 @@ import io.github.aoguai.sesameag.data.StatusFlags
 import io.github.aoguai.sesameag.hook.ApplicationHookConstants
 import io.github.aoguai.sesameag.hook.ExchangeOptionsRefreshBridge
 import io.github.aoguai.sesameag.task.TaskStatus
+import io.github.aoguai.sesameag.task.common.DeferredReason
+import io.github.aoguai.sesameag.task.common.TaskFlowActionResult
+import io.github.aoguai.sesameag.task.common.TaskFlowAdapter
+import io.github.aoguai.sesameag.task.common.TaskFlowEngine
+import io.github.aoguai.sesameag.task.common.TaskFlowItem
+import io.github.aoguai.sesameag.task.common.TaskFlowPhase
+import io.github.aoguai.sesameag.task.common.TaskRpcFailureType
 import io.github.aoguai.sesameag.task.exchange.ExchangeCost
 import io.github.aoguai.sesameag.task.exchange.ExchangeEffectCatalog
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
 import io.github.aoguai.sesameag.task.exchange.ExchangeOptionRow
+import io.github.aoguai.sesameag.task.exchange.ExchangeFetchPacing
 import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsCache
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsSnapshot
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafety
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafetyRules
 import io.github.aoguai.sesameag.util.Files
@@ -19,6 +28,7 @@ import io.github.aoguai.sesameag.util.GlobalThreadPools
 import io.github.aoguai.sesameag.util.JsonUtil
 import io.github.aoguai.sesameag.util.Log
 import io.github.aoguai.sesameag.util.ResChecker
+import io.github.aoguai.sesameag.util.RpcOfflineRisk
 import io.github.aoguai.sesameag.util.TaskBlacklist
 import io.github.aoguai.sesameag.util.maps.UserMap
 import org.json.JSONArray
@@ -89,7 +99,6 @@ class ChouChouLe {
         var taskId: String = "",
         var innerAction: String = "",
         var rightsTimes: Int = 0,
-        var reportedRightsTimes: Int? = null,
         var alreadyReceiveStageAwardCount: Int? = null,
         var rightsTimesLimit: Int = 0,
         var awardType: String = "",
@@ -104,12 +113,6 @@ class ChouChouLe {
         fun getRemainingTimes(): Int = max(0, rightsTimesLimit - rightsTimes)
     }
 
-    private enum class TaskMutationResult {
-        ACKNOWLEDGED,
-        BLOCKED_BY_QUOTA,
-        NOT_ACKNOWLEDGED,
-    }
-
     private data class IpDrawActivity(
         val activityId: String,
         val endTime: Long,
@@ -120,6 +123,7 @@ class ChouChouLe {
         val endTime: Long,
         val balanceCent: Int,
         val items: List<IpDrawMallItem>,
+        val rawItems: JSONArray,
     )
 
     private data class IpDrawMallItem(
@@ -220,69 +224,52 @@ class ChouChouLe {
      * 返回是否该类型已全部完成
      */
     private fun doChouchoule(drawType: String): Boolean {
-        val noProgressActionTaskIds = mutableSetOf<String>()
-        val noProgressAwardTaskIds = mutableSetOf<String>()
-        var doubleCheck: Boolean
-        var rounds = 0
+        var tasksCompleted = false
         try {
             runCatching {
                 AntFarmRpcCall.refinedOperation("DRAW_MACHINE", "antfarm_villa", "RPC")
             }
-            do {
-                doubleCheck = false
-                if (ApplicationHookConstants.isOffline()) return false
-                rounds++
-                val tasks = queryChouchouleTasks(drawType)
-                if (tasks == null) {
-                    val taskName = if (drawType == "ipDraw") "IP抽抽乐" else "日常抽抽乐"
-                    Log.error(TAG, "${taskName}任务流状态未确认，保留任务重试，继续独立抽奖余额处理")
-                    break
-                }
+            var currentTasks = emptyMap<String, TaskInfo>()
+            tasksCompleted = TaskFlowEngine(object : TaskFlowAdapter {
+                override val moduleName = FARM_BLACKLIST_MODULE
+                override val flowName = "抽抽乐[$drawType]"
+                override fun query() = JSONObject(AntFarmRpcCall.chouchouleListFarmTask(drawType))
+                override fun isQuerySuccess(response: JSONObject) =
+                    ResChecker.checkRes(TAG, response) && response.optJSONArray("farmTaskList") != null
 
-                for (task in tasks) {
-                    if (TaskStatus.FINISHED.name == task.taskStatus) {
-                        if (task.taskId in noProgressAwardTaskIds) {
-                            continue
-                        }
-                        if (receiveTaskAward(drawType, task)) {
-                            GlobalThreadPools.sleepCompat(300L)
-                            val refreshedTask =
-                                queryChouchouleTasks(drawType)
-                                    ?.firstOrNull { it.taskId == task.taskId }
-                            if (hasTaskAwardProgressed(task, refreshedTask)) {
-                                doubleCheck = true
-                            } else {
-                                noProgressAwardTaskIds.add(task.taskId)
-                                Log.error(TAG, "抽抽乐奖励[${task.title}] ACK 后状态未确认，当前轮不再重复领取")
-                            }
-                        } else {
-                            noProgressAwardTaskIds.add(task.taskId)
-                        }
-                    } else if (TaskStatus.TODO.name == task.taskStatus) {
-                        if (task.taskId !in noProgressActionTaskIds &&
-                            task.getRemainingTimes() > 0 &&
-                            !isBlacklistedTask(task)
-                        ) {
-                            when (doChouTask(drawType, task)) {
-                                TaskMutationResult.ACKNOWLEDGED -> {
-                                    val refreshedTask =
-                                        queryChouchouleTasks(drawType)
-                                            ?.firstOrNull { it.taskId == task.taskId }
-                                    if (hasTaskActionProgressed(task, refreshedTask)) {
-                                        doubleCheck = true
-                                    } else {
-                                        noProgressActionTaskIds.add(task.taskId)
-                                        Log.error(TAG, "抽抽乐任务[${task.title}] ACK 后状态未推进，当前轮不再重复提交")
-                                    }
-                                }
-
-                                TaskMutationResult.BLOCKED_BY_QUOTA,
-                                TaskMutationResult.NOT_ACKNOWLEDGED -> noProgressActionTaskIds.add(task.taskId)
-                            }
-                        }
+                override fun extractItems(response: JSONObject): List<TaskFlowItem> {
+                    val tasks = parseTasks(response.getJSONArray("farmTaskList"))
+                    currentTasks = tasks.associateBy { it.taskId }
+                    return tasks.map { task ->
+                        TaskFlowItem(
+                            id = task.taskId, title = task.title, status = task.taskStatus,
+                            type = task.innerAction, current = task.rightsTimes, limit = task.rightsTimesLimit,
+                            progress = "${task.rightsTimes}:${task.alreadyReceiveStageAwardCount}:${task.awardCount}",
+                        )
                     }
                 }
-            } while (doubleCheck && rounds < 32)
+
+                override fun mapPhase(item: TaskFlowItem) = when (item.status) {
+                    "FINISHED" -> TaskFlowPhase.REWARD_READY
+                    "TODO" -> if ((item.limit ?: 0) <= 0 || (item.current ?: 0) < (item.limit ?: 0))
+                        TaskFlowPhase.READY_TO_COMPLETE else TaskFlowPhase.TERMINAL
+                    "RECEIVED" -> TaskFlowPhase.TERMINAL
+                    else -> TaskFlowPhase.UNKNOWN
+                }
+
+                override fun isBlacklisted(item: TaskFlowItem) =
+                    currentTasks[item.id]?.let(::isBlacklistedTask) == true
+
+                override fun complete(item: TaskFlowItem): TaskFlowActionResult =
+                    doChouTask(drawType, currentTasks.getValue(item.id))
+
+                override fun receive(item: TaskFlowItem): TaskFlowActionResult =
+                    receiveTaskAward(drawType, currentTasks.getValue(item.id))
+
+                override fun onQueryFailed(response: JSONObject) = Log.error(TAG, "$flowName 查询失败:$response")
+                override fun logInfo(message: String) = Log.farm(message)
+                override fun logError(message: String) = Log.error(TAG, message)
+            }, roundSleepMs = 300L).run().completed
         } catch (t: Throwable) {
             val taskName = if (drawType == "ipDraw") "IP抽抽乐" else "日常抽抽乐"
             Log.printStackTrace("doChouchoule err:", t)
@@ -306,20 +293,13 @@ class ChouChouLe {
         if (!drawSuccess) return false
 
         // 最后校验是否真的全部完成
-        return verifyFinished(drawType, noProgressActionTaskIds, noProgressAwardTaskIds)
+        return tasksCompleted && verifyFinished(drawType)
     }
 
     /*
      校验是否还有未完成的任务或抽奖
      */
-    private fun verifyFinished(
-        drawType: String,
-        noProgressActionTaskIds: Set<String>,
-        noProgressAwardTaskIds: Set<String>,
-    ): Boolean {
-        if (noProgressActionTaskIds.isNotEmpty() || noProgressAwardTaskIds.isNotEmpty()) {
-            return false
-        }
+    private fun verifyFinished(drawType: String): Boolean {
         return try {
             val tasks = queryChouchouleTasks(drawType) ?: return false
             for (task in tasks) {
@@ -377,38 +357,6 @@ class ChouChouLe {
         }
     }
 
-    private fun hasTaskActionProgressed(
-        before: TaskInfo,
-        after: TaskInfo?,
-    ): Boolean {
-        val afterTask = after ?: return false
-        if (afterTask.taskStatus == TaskStatus.FINISHED.name ||
-            afterTask.taskStatus == TaskStatus.RECEIVED.name
-        ) {
-            return true
-        }
-        val beforeRightsTimes = before.reportedRightsTimes
-        val afterRightsTimes = afterTask.reportedRightsTimes
-        return beforeRightsTimes != null &&
-            afterRightsTimes != null &&
-            afterRightsTimes > beforeRightsTimes
-    }
-
-    private fun hasTaskAwardProgressed(
-        before: TaskInfo,
-        after: TaskInfo?,
-    ): Boolean {
-        val afterTask = after ?: return false
-        if (afterTask.taskStatus == TaskStatus.RECEIVED.name) {
-            return true
-        }
-        val beforeStageAwardCount = before.alreadyReceiveStageAwardCount
-        val afterStageAwardCount = afterTask.alreadyReceiveStageAwardCount
-        return beforeStageAwardCount != null &&
-            afterStageAwardCount != null &&
-            afterStageAwardCount > beforeStageAwardCount
-    }
-
     private fun isBlacklistedTask(task: TaskInfo): Boolean =
         listOf(
             task.innerAction
@@ -420,24 +368,7 @@ class ChouChouLe {
         ).filter { it.isNotBlank() }
             .any { TaskBlacklist.isTaskInBlacklist(FARM_BLACKLIST_MODULE, it) }
 
-    private fun getResponseMessage(jo: JSONObject): String {
-        val resData = jo.optJSONObject("resData")
-        return listOf(
-            jo.optString("resultDesc"),
-            jo.optString("desc"),
-            jo.optString("memo"),
-            resData?.optString("resultDesc").orEmpty(),
-            resData?.optString("desc").orEmpty(),
-            resData?.optString("memo").orEmpty(),
-        ).firstOrNull { it.isNotBlank() }.orEmpty()
-    }
-
     private fun extractDrawTimes(jo: JSONObject): Int = jo.optInt("drawTimes", -1)
-
-    private fun isTaskQuotaReachedResponse(jo: JSONObject): Boolean {
-        val resultCode = jo.optString("resultCode").ifBlank { jo.optString("code") }
-        return resultCode == "309"
-    }
 
     /**
      * 解析任务列表
@@ -459,7 +390,6 @@ class ChouChouLe {
                     taskId = item.optString("bizKey").ifBlank { item.optString("taskId") },
                     innerAction = item.optString("innerAction"),
                     rightsTimes = reportedRightsTimes ?: 0,
-                    reportedRightsTimes = reportedRightsTimes,
                     alreadyReceiveStageAwardCount =
                         item.optInt("alreadyReceiveStageAwardCount")
                             .takeIf { item.has("alreadyReceiveStageAwardCount") && !item.isNull("alreadyReceiveStageAwardCount") },
@@ -500,69 +430,40 @@ class ChouChouLe {
                 ?.takeIf { it.isNotBlank() }
         }.getOrNull()
 
-    private fun resolveDirectFinishAttemptCount(task: TaskInfo): Int {
-        val remainingTimes = task.getRemainingTimes()
-        if (remainingTimes > 0) {
-            return remainingTimes
-        }
-        if (task.rightsTimesLimit <= 0) {
-            Log.farm("直连任务[${task.title}]剩余次数字段异常，按单次尝试")
-            return 1
-        }
-        return 0
-    }
-
     /**
      * 执行任务
      */
     private fun doChouTask(
         drawType: String,
         task: TaskInfo,
-    ): TaskMutationResult {
-        try {
-            if (task.taskId.isBlank()) {
-                Log.farm("抽抽乐任务[${task.title}]缺少 taskId，跳过")
-                return TaskMutationResult.NOT_ACKNOWLEDGED
-            }
-            val taskName = if (drawType == "ipDraw") "IP抽抽乐" else "抽抽乐"
-            val renderConfigKey = extractRenderConfigKey(task)
-
-            if (renderConfigKey != null || shouldUseDirectFinishTaskFlow(task)) {
-                return handleDirectFinishTask(drawType, task, renderConfigKey)
-            }
-            val s = AntFarmRpcCall.chouchouleDoFarmTask(drawType, task.taskId)
-            val jo = JSONObject(s)
-            val resultCode = jo.optString("resultCode")
-            if ("DRAW_MACHINE07" == resultCode) {
-                Log.farm("${taskName}任务[${task.title}]失败: 饲料不足，停止后续尝试")
-                return TaskMutationResult.NOT_ACKNOWLEDGED
-            }
-            if (isTaskQuotaReachedResponse(jo)) {
-                Log.farm("${taskName}任务[${task.title}]今日次数已达上限，停止继续尝试")
-                return TaskMutationResult.NOT_ACKNOWLEDGED
-            }
-            if (ResChecker.checkRes(TAG, jo)) {
-                Log.farm("$taskName🧾️[任务: ${task.title}]")
-                GlobalThreadPools.sleepCompat(1000L)
-                return TaskMutationResult.ACKNOWLEDGED
-            }
-            return TaskMutationResult.NOT_ACKNOWLEDGED
-        } catch (t: Throwable) {
-            Log.printStackTrace("执行抽抽乐任务 err:", t)
-            return TaskMutationResult.NOT_ACKNOWLEDGED
+    ): TaskFlowActionResult {
+        if (task.taskId.isBlank()) return TaskFlowActionResult.failure(
+            TaskRpcFailureType.NON_RETRYABLE_INVALID, message = "抽抽乐任务缺少 taskId",
+            detail = "taskName=${task.title}", continueCurrentRoundOnFailure = true,
+        )
+        val farm = AntFarm.instance ?: return TaskFlowActionResult.failure(
+            TaskRpcFailureType.RETRYABLE_RPC, message = "庄园实例未就绪", stopCurrentRound = true,
+        )
+        val renderConfigKey = extractRenderConfigKey(task)
+        if (renderConfigKey != null || shouldUseDirectFinishTaskFlow(task)) {
+            return handleDirectFinishTask(drawType, task, renderConfigKey)
         }
+        val response = JSONObject(AntFarmRpcCall.chouchouleDoFarmTask(drawType, task.taskId))
+        if (!ResChecker.checkRes(TAG, response)) {
+            return farm.buildFarmTaskFailureResult(response, task.taskId, task.title, "完成", "doFarmTask")
+        }
+        GlobalThreadPools.sleepCompat(1000L)
+        return TaskFlowActionResult.success()
     }
 
     private fun finishTaskDirectly(
         drawType: String,
         task: TaskInfo,
         taskSceneCode: String,
-    ): TaskMutationResult {
-        val taskName = if (drawType == "ipDraw") "IP抽抽乐" else "抽抽乐"
-        val attemptCount = resolveDirectFinishAttemptCount(task)
-        if (attemptCount <= 0) {
-            return TaskMutationResult.NOT_ACKNOWLEDGED
-        }
+    ): TaskFlowActionResult {
+        val farm = AntFarm.instance ?: return TaskFlowActionResult.failure(
+            TaskRpcFailureType.RETRYABLE_RPC, message = "庄园实例未就绪", stopCurrentRound = true,
+        )
         val outBizNo =
             buildString {
                 append(task.taskId)
@@ -575,17 +476,8 @@ class ChouChouLe {
             }
         val response = AntFarmRpcCall.finishTask(task.taskId, taskSceneCode, outBizNo)
         val jo = JSONObject(response)
-        if (isTaskQuotaReachedResponse(jo)) {
-            Log.farm("直连任务[${task.title}]今日权益已达上限，停止继续尝试")
-            return TaskMutationResult.BLOCKED_BY_QUOTA
-        }
-        if (ResChecker.checkRes(TAG, jo)) {
-            Log.farm("$taskName🧾️[任务: ${task.title}]#第${task.rightsTimes + 1}次")
-            return TaskMutationResult.ACKNOWLEDGED
-        }
-        val message = getResponseMessage(jo)
-        Log.farm("直连任务完成失败[${task.title}]: ${message.ifBlank { jo.toString() }}")
-        return TaskMutationResult.NOT_ACKNOWLEDGED
+        if (ResChecker.checkRes(TAG, jo)) return TaskFlowActionResult.success()
+        return farm.buildFarmTaskFailureResult(jo, task.taskId, task.title, "完成[$drawType]", "finishTask")
     }
 
     /**
@@ -595,17 +487,15 @@ class ChouChouLe {
         drawType: String,
         task: TaskInfo,
         renderConfigKey: String?,
-    ): TaskMutationResult {
-        try {
-            if (renderConfigKey != null && !waitForRenderTaskDuration(drawType, task, renderConfigKey)) {
-                return TaskMutationResult.NOT_ACKNOWLEDGED
-            }
-            val taskSceneCode = if (drawType == "ipDraw") "ANTFARM_IP_DRAW_TASK" else "ANTFARM_DAILY_DRAW_TASK"
-            return finishTaskDirectly(drawType, task, taskSceneCode)
-        } catch (t: Throwable) {
-            Log.printStackTrace("处理直连任务 err:", t)
-            return TaskMutationResult.NOT_ACKNOWLEDGED
+    ): TaskFlowActionResult {
+        if (renderConfigKey != null && !waitForRenderTaskDuration(drawType, task, renderConfigKey)) {
+            return TaskFlowActionResult.failure(
+                TaskRpcFailureType.RETRYABLE_RPC, message = "广告时长查询未确认，原响应已记录",
+                rpc = "adTaskApplayerQuery", continueCurrentRoundOnFailure = true,
+            )
         }
+        val taskSceneCode = if (drawType == "ipDraw") "ANTFARM_IP_DRAW_TASK" else "ANTFARM_DAILY_DRAW_TASK"
+        return finishTaskDirectly(drawType, task, taskSceneCode)
     }
 
     private fun waitForRenderTaskDuration(
@@ -618,7 +508,7 @@ class ChouChouLe {
         val durationSeconds = result.optJSONObject("resultData")?.optDouble("duration", -1.0) ?: -1.0
         if (!result.optBoolean("success") || result.optString("errCode") != "0" || durationSeconds <= 0.0) {
             val taskName = if (drawType == "ipDraw") "IP抽抽乐" else "抽抽乐"
-            Log.farm("${taskName}任务[${task.title}]广告时长查询未确认：$result")
+            Log.error(TAG, "${taskName}任务[${task.title}]广告时长查询未确认：$result")
             return false
         }
         GlobalThreadPools.sleepCompat((durationSeconds * 1000.0).toLong())
@@ -631,32 +521,21 @@ class ChouChouLe {
     private fun receiveTaskAward(
         drawType: String,
         task: TaskInfo,
-    ): Boolean {
-        try {
-            if (task.taskId.isBlank()) {
-                Log.farm("抽抽乐奖励[${task.title}]缺少 taskId，跳过领取")
-                return false
-            }
-            if (task.awardType == "ALLPURPOSE" &&
-                AntFarm.instance?.prepareFarmAwardCapacity(task.awardCount) != true
-            ) {
-                Log.farm("抽抽乐奖励[${task.title}]饲料容量不足，保留后续领取")
-                return false
-            }
-            val s =
-                AntFarmRpcCall.chouchouleReceiveFarmTaskAward(
-                    drawType,
-                    task.taskId,
-                    task.awardType,
-                )
-            val jo = JSONObject(s)
-            if (ResChecker.checkRes(TAG, jo)) {
-                return true
-            }
-        } catch (t: Throwable) {
-            Log.printStackTrace("receiveFarmTaskAward err:", t)
+    ): TaskFlowActionResult {
+        if (task.taskId.isBlank()) return TaskFlowActionResult.failure(
+            TaskRpcFailureType.NON_RETRYABLE_INVALID, message = "抽抽乐奖励缺少 taskId",
+            detail = "taskName=${task.title}", continueCurrentRoundOnFailure = true,
+        )
+        val farm = AntFarm.instance ?: return TaskFlowActionResult.failure(
+            TaskRpcFailureType.RETRYABLE_RPC, message = "庄园实例未就绪", stopCurrentRound = true,
+        )
+        if (task.awardType == "ALLPURPOSE" && !farm.prepareFarmAwardCapacity(task.awardCount)) {
+            return TaskFlowActionResult.defer(DeferredReason.CAPACITY_LIMIT, message = "饲料容量不足，保留后续领取")
         }
-        return false
+        val response = JSONObject(AntFarmRpcCall.chouchouleReceiveFarmTaskAward(drawType, task.taskId, task.awardType))
+        if (ResChecker.checkRes(TAG, response)) return TaskFlowActionResult.success()
+        return farm.buildFarmTaskFailureResult(response, task.taskId, task.title, "领奖", "receiveFarmTaskAward")
+            .copy(refreshAfterAction = true)
     }
 
     /**
@@ -829,7 +708,9 @@ class ChouChouLe {
         if (farm.enableChouchoule?.value != true || farm.autoExchange?.value != true || ApplicationHookConstants.isOffline()) return
         try {
             val response = JSONObject(AntFarmRpcCall.queryDrawMachineActivity_New("ipDrawMachine", "dailyDrawMachine"))
-            if (!ResChecker.checkRes(TAG, response)) return
+            if (!ResChecker.checkRes(TAG, response)) {
+                return
+            }
             val activity = response.optJSONObject("drawMachineActivity") ?: return
             val activityId = activity.optString("activityId")
             if (activityId.isNotBlank()) batchExchangeRewards(activityId, activity.optLong("endTime", 0))
@@ -867,7 +748,7 @@ class ChouChouLe {
                 }
             }
 
-            var snapshot = queryIpDrawMallSnapshot(IpDrawActivity(activityId, endTime)) ?: return
+            var snapshot = loadIpDrawMallSnapshot(IpDrawActivity(activityId, endTime))
             val userId = UserMap.currentUid
             val data = syncIpDrawShopSnapshot(snapshot)
             Log.farm("[自动兑换]: 当前持有总碎片: ${snapshot.balanceCent / 100}")
@@ -887,18 +768,6 @@ class ChouChouLe {
 
             for ((item, targetCount) in sequence) {
                 var currentItem = snapshot.items.firstOrNull { it.skuId == item.skuId } ?: item
-                val blockReason = blockedIpDrawMallItemReason(currentItem)
-                if (blockReason.isNotBlank()) {
-                    Log.farm("[自动兑换]: [${currentItem.name}] 跳过：$blockReason")
-                    if (!isCustom && shouldStopDefaultExchangeForNoEnoughPoint(currentItem)) {
-                        return
-                    }
-                    continue
-                }
-                if (currentItem.safety != ExchangeSafety.AUTO) {
-                    Log.farm("[自动兑换]: [${currentItem.name}] 跳过：${currentItem.safetyReason.ifBlank { currentItem.safety.name }}")
-                    continue
-                }
                 if (currentItem.spuId.isBlank() || currentItem.skuId.isBlank()) {
                     Log.farm("[自动兑换]: [${currentItem.name}] 跳过：缺少 spuId/skuId")
                     continue
@@ -1019,13 +888,31 @@ class ChouChouLe {
         }
     }
 
-    fun refreshIpChouChouLeExchangeOptionsFromRpc(): List<ExchangeOptionRow> {
+    fun refreshIpChouChouLeExchangeOptionsFromRpc(forceRefresh: Boolean = false): List<ExchangeOptionRow> {
         val activity = queryActiveIpDrawActivity() ?: throw IllegalStateException("未获取到有效的IP抽抽乐活动")
-        val snapshot = queryIpDrawMallSnapshot(activity) ?: throw IllegalStateException("未获取到IP抽抽乐商店快照")
+        val snapshot = loadIpDrawMallSnapshot(activity, forceRefresh)
         syncIpDrawShopSnapshot(snapshot)
-        val rows = snapshot.items.map { buildIpChouChouLeExchangeOption(it).toOptionRow() }
-        ExchangeOptionsCache.save(UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FARM_IP_CHOUCHOULE, rows)
-        return rows
+        return snapshot.items.map { buildIpChouChouLeExchangeOption(it).toOptionRow() }
+    }
+
+    private fun loadIpDrawMallSnapshot(activity: IpDrawActivity, forceRefresh: Boolean = false): IpDrawMallSnapshot {
+        val snapshot = ExchangeOptionsCache.getOrFetch(UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FARM_IP_CHOUCHOULE, forceRefresh) {
+            ExchangeFetchPacing.domainStartDelay()
+            val mall = queryIpDrawMallSnapshot(activity) ?: error("未获取到完整IP抽抽乐商店快照")
+            val payload = JSONObject().put("activityId", mall.activityId).put("endTime", mall.endTime)
+                .put("balanceCent", mall.balanceCent).put("items", mall.rawItems)
+            ExchangeOptionsSnapshot(mall.items.map { buildIpChouChouLeExchangeOption(it).toOptionRow() }, payload)
+        }
+        val payload = snapshot.payload
+        check(payload.getString("activityId") == activity.activityId && isIpDrawActivityActive(activity)) {
+            "IP抽抽乐活动已变化，请在设置页手动刷新兑换列表"
+        }
+        val rawItems = payload.getJSONArray("items")
+        val items = LinkedHashMap<String, IpDrawMallItem>()
+        for (i in 0 until rawItems.length()) {
+            parseIpDrawMallItems(rawItems.getJSONObject(i)).forEach { items.putIfAbsent(it.skuId, it) }
+        }
+        return IpDrawMallSnapshot(activity.activityId, activity.endTime, payload.getInt("balanceCent"), items.values.toList(), rawItems)
     }
 
     private fun queryActiveIpDrawActivity(): IpDrawActivity? {
@@ -1051,7 +938,6 @@ class ChouChouLe {
     private fun queryIpDrawMallSnapshot(
         activity: IpDrawActivity,
         pageSize: Int = 10,
-        maxPages: Int = 20,
     ): IpDrawMallSnapshot? {
         if (activity.activityId.isBlank()) {
             Log.farm("IP抽抽乐商店💸[缺少 activityId，无法查询]")
@@ -1061,13 +947,13 @@ class ChouChouLe {
             return null
         }
         val items = mutableListOf<IpDrawMallItem>()
+        val rawItems = JSONArray()
         val seenSkuIds = linkedSetOf<String>()
-        val seenStartIndexes = linkedSetOf<Int>()
+        val seenItemIds = linkedSetOf<String>()
         var balanceCent = 0
         var startIndex = 0
-        var pageCount = 0
 
-        while (pageCount < maxPages && seenStartIndexes.add(startIndex)) {
+        while (true) {
             val jo =
                 runCatching {
                     JSONObject(AntFarmRpcCall.getItemList(activity.activityId, pageSize, startIndex))
@@ -1086,44 +972,38 @@ class ChouChouLe {
                 ?.takeIf { it.has("cent") }
                 ?.let { balanceCent = it.optInt("cent", balanceCent) }
 
-            val itemInfoVOList = jo.optJSONArray("itemInfoVOList")
-            if (itemInfoVOList == null || itemInfoVOList.length() == 0) {
-                break
-            }
-
-            var newItemCount = 0
+            val itemInfoVOList = jo.optJSONArray("itemInfoVOList") ?: return null
+            val seenCount = seenItemIds.size
             for (i in 0 until itemInfoVOList.length()) {
-                val itemJo = itemInfoVOList.optJSONObject(i) ?: continue
+                val itemJo = itemInfoVOList.optJSONObject(i) ?: return null
+                rawItems.put(itemJo)
+                itemJo.optString("spuId").trim().takeIf { it.isNotBlank() }?.let { seenItemIds.add("spu:$it") }
+                val skuList = itemJo.optJSONArray("skuModelList")
+                if (skuList != null) {
+                    for (j in 0 until skuList.length()) {
+                        skuList.optJSONObject(j)?.optString("skuId")?.trim()?.takeIf { it.isNotBlank() }
+                            ?.let { seenItemIds.add("sku:$it") }
+                    }
+                }
                 parseIpDrawMallItems(itemJo).forEach { item ->
                     if (seenSkuIds.add(item.skuId)) {
                         items.add(item)
-                        newItemCount++
                     }
                 }
             }
 
-            pageCount++
-            if (newItemCount == 0) {
-                Log.farm("IP抽抽乐商店💸[分页未发现新商品，停止继续查询: startIndex=$startIndex]")
-                break
-            }
-
-            val responseNextIndex = if (jo.has("nextStartIndex")) jo.optInt("nextStartIndex", -1) else -1
-            val nextStartIndex = if (responseNextIndex > startIndex) responseNextIndex else startIndex + itemInfoVOList.length()
             val hasMore = if (jo.has("hasMore")) jo.optBoolean("hasMore", false) else itemInfoVOList.length() >= pageSize
-            if (!hasMore || nextStartIndex <= startIndex) {
-                if (hasMore && nextStartIndex <= startIndex) {
-                    Log.farm("IP抽抽乐商店💸[分页 nextStartIndex 未前进，停止继续查询: startIndex=$startIndex]")
-                }
-                break
+            if (!hasMore) break
+            val nextStartIndex = if (jo.has("nextStartIndex")) jo.optInt("nextStartIndex", -1) else startIndex + itemInfoVOList.length()
+            if (itemInfoVOList.length() == 0 || seenItemIds.size == seenCount || nextStartIndex <= startIndex) {
+                Log.farm("IP抽抽乐商店💸[列表分页未前进: startIndex=$startIndex count=${itemInfoVOList.length()} hasMore=$hasMore nextStartIndex=$nextStartIndex]")
+                return null
             }
             startIndex = nextStartIndex
+            ExchangeFetchPacing.pageTurnDelay()
         }
 
-        if (pageCount >= maxPages) {
-            Log.farm("IP抽抽乐商店💸[分页达到上限${maxPages}页，停止继续查询]")
-        }
-        return IpDrawMallSnapshot(activity.activityId, activity.endTime, balanceCent, items)
+        return IpDrawMallSnapshot(activity.activityId, activity.endTime, balanceCent, items, rawItems)
     }
 
     private fun queryIpDrawMallItemDetail(item: IpDrawMallItem): IpDrawMallItemDetail? {
@@ -1324,23 +1204,6 @@ class ChouChouLe {
                 }
             }
 
-        for (item in sortedItems) {
-            if (item.safety != ExchangeSafety.AUTO) continue
-            val blockReason = blockedIpDrawMallItemReason(item)
-            if (blockReason.isNotBlank()) {
-                if (shouldStopDefaultExchangeForNoEnoughPoint(item)) {
-                    Log.farm("[自动兑换]: 最高价值项 [${item.name}] 碎片不足，等攒够再换，终止本次兑换")
-                    return emptyList()
-                }
-                continue
-            }
-            if (item.isNewEgg) continue
-            if (item.priceCent > 0 && snapshot.balanceCent < item.priceCent) {
-                Log.farm("[自动兑换]: 最高价值项 [${item.name}] 碎片不足，等攒够再换，终止本次兑换")
-                return emptyList()
-            }
-            break
-        }
         return sortedItems.map { it to (if (it.limitCount > 0) it.limitCount else 1) }
     }
 

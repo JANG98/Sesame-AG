@@ -35,7 +35,9 @@ import io.github.aoguai.sesameag.hook.keepalive.PersistentLaunchPolicy
 import io.github.aoguai.sesameag.hook.keepalive.PersistentReconcileMode
 import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleDefaults
 import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleKind
+import io.github.aoguai.sesameag.hook.keepalive.PersistentSchedulePrecisionPolicy
 import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleRegistry
+import io.github.aoguai.sesameag.hook.keepalive.PersistentScheduleState
 import io.github.aoguai.sesameag.hook.keepalive.ScheduledTaskRouter
 import io.github.aoguai.sesameag.hook.keepalive.SystemWakeScheduler
 import io.github.aoguai.sesameag.hook.keepalive.UnifiedScheduler
@@ -320,7 +322,8 @@ class ApplicationHook {
         pendingPersistentLaunchScheduleId = scheduleId
         pendingPersistentLaunchBatch =
             activityIntent.getBooleanExtra(SystemWakeScheduler.EXTRA_PLANNED_BATCH, false)
-        scheduleId?.let { ScheduledTaskRouter.confirmTargetLaunch(it) }
+        pendingPersistentLaunchConfirmationAt = activityIntent.getLongExtra(SystemWakeScheduler.EXTRA_CONFIRMATION_AT, 0L)
+        activityIntent.removeExtra(SystemWakeScheduler.EXTRA_CONFIRMATION_AT)
         activityIntent.removeExtra(SystemWakeScheduler.EXTRA_PERSISTENT_ALARM_LAUNCH)
         activityIntent.removeExtra(SystemWakeScheduler.EXTRA_SCHEDULE_ID)
         activityIntent.removeExtra(SystemWakeScheduler.EXTRA_PLANNED_BATCH)
@@ -350,6 +353,12 @@ class ApplicationHook {
                 return
             }
             if (!launchScheduleId.isNullOrBlank()) {
+                val confirmed = ScheduledTaskRouter.confirmTargetLaunch(launchScheduleId, pendingPersistentLaunchConfirmationAt)
+                pendingPersistentLaunchConfirmationAt = 0L
+                if (!confirmed) {
+                    pendingPersistentLaunchScheduleId = null
+                    return
+                }
                 val schedule = PersistentScheduleRegistry.get(launchScheduleId)
                 if (schedule != null) {
                     if (ScheduledTaskRouter.fire(context, schedule, source)) {
@@ -664,6 +673,9 @@ class ApplicationHook {
         @Volatile
         private var pendingPersistentLaunchBatch: Boolean = false
 
+        @Volatile
+        private var pendingPersistentLaunchConfirmationAt: Long = 0L
+
         private fun ensureMainTask() {
             if (mainTask == null) {
                 mainTask = MainTask("主任务") { runMainTaskLogic() }
@@ -842,6 +854,7 @@ class ApplicationHook {
             val currentVersion = alipayVersion
             if (currentVersion.versionString.isBlank()) {
                 record(TAG, "⚠️ 无法识别目标应用版本，继续尝试初始化 RPC")
+                Log.w(TAG, "host_version_unknown: 无法识别目标应用版本，继续尝试初始化 RPC")
                 return true
             }
             if (currentVersion >= MIN_SUPPORTED_RPC_VERSION) {
@@ -851,6 +864,7 @@ class ApplicationHook {
             val message = "目标应用版本过低，不支持当前 RPC 结构，最低版本 ${MIN_SUPPORTED_RPC_VERSION.versionString}"
             record(TAG, message)
             Log.runtime(TAG, "rpc unsupported host version: current=$currentVersion min=${MIN_SUPPORTED_RPC_VERSION.versionString}")
+            Log.w(TAG, "rpc unsupported host version: current=$currentVersion min=${MIN_SUPPORTED_RPC_VERSION.versionString}")
             updateRunningStatus(message)
             ApplicationHookConstants.clearPendingTriggers("unsupported_host_version")
             AccountSessionCoordinator.blockWorkflow(appContext, "unsupported_host_version")
@@ -1068,18 +1082,16 @@ class ApplicationHook {
                             execScheduleField.getTriggerSpec(),
                             baseTime,
                         )
-                    if (nextPointAt != null && nextPointAt < intervalTargetTime) {
+                    if (nextPointAt != null && nextPointAt <= intervalTargetTime) {
                         record(TAG, "设置定时执行:${TimeUtil.getCommonDate(nextPointAt)}")
                         targetTime = nextPointAt
                         delayMillis = targetTime - baseTime
                     }
                 }
-                nextExecutionTime = if (targetTime > 0) targetTime else (baseTime + delayMillis)
-                mainTaskNextScheduleUpdatedAtMs = System.currentTimeMillis()
+                val triggerAt = if (targetTime > 0) targetTime else (baseTime + delayMillis)
                 ensureScheduler()
                 val context = appContext
                 if (context != null) {
-                    val triggerAt = nextExecutionTime
                     val activeSession = AccountSessionCoordinator.currentSession()
                     val schedule =
                         UnifiedScheduler.schedulePersistentTrigger(
@@ -1088,25 +1100,29 @@ class ApplicationHook {
                             kind = PersistentScheduleKind.GLOBAL_POLL,
                             triggerAtMs = triggerAt,
                             dedupeKey = "alarm_poll",
+                            precisionPolicy = if (targetTime > 0) PersistentSchedulePrecisionPolicy.USER_EXACT
+                                else PersistentSchedulePrecisionPolicy.FLEXIBLE_POLL,
                             payloadJson = "{}",
                             toleranceMs = maxOf(checkInterval.toLong(), PersistentScheduleDefaults.DEFAULT_TOLERANCE_MS),
                             ownerUserId = activeSession?.userId ?: currentUid,
                             sessionEpoch = activeSession?.sessionEpoch ?: AccountSessionCoordinator.currentSessionEpoch(),
                         )
-                    if (schedule.lastError != null) {
-                        if (PersistentLaunchPolicy.isFrontLaunchDisabled(schedule.lastError)) {
-                            record(TAG, "已禁止系统调度前台拉起目标应用，轮询任务降级为仅进程存活时等待")
-                        }
-                        UnifiedScheduler.scheduleLongDelay(delayMillis, "轮询任务") {
-                            ApplicationHookEntry.onPollAlarm()
-                        }
-                    } else {
+                    if (schedule.state == PersistentScheduleState.SCHEDULED) {
+                        nextExecutionTime = schedule.triggerAtMs
+                        mainTaskNextScheduleUpdatedAtMs = System.currentTimeMillis()
                         UnifiedScheduler.cancelNamedTask("轮询任务")
+                    } else {
+                        val previous = PersistentScheduleRegistry.list().filter {
+                            it.kind == PersistentScheduleKind.GLOBAL_POLL &&
+                                it.state == PersistentScheduleState.SCHEDULED &&
+                                it.ownerUserId == activeSession?.userId && it.sessionEpoch == activeSession?.sessionEpoch
+                        }.minByOrNull { it.triggerAtMs }
+                        nextExecutionTime = previous?.triggerAtMs ?: 0L
+                        if (previous == null) Notify.updatePersistentSchedule(schedule)
+                        record(TAG, "下次执行计划注册失败，保留仍有效的旧计划: ${schedule.lastError}")
                     }
                 } else {
-                    UnifiedScheduler.scheduleLongDelay(delayMillis, "轮询任务") {
-                        ApplicationHookEntry.onPollAlarm()
-                    }
+                    record(TAG, "缺少应用 Context，未发布新的执行计划")
                 }
             } catch (e: Exception) {
                 Log.printStackTrace(TAG, "scheduleNextExecution failed", e)
@@ -1139,12 +1155,14 @@ class ApplicationHook {
                 }
                 if (!RuntimeIdentityGuard.isTrustedForExecution()) {
                     record(TAG, "instance_rejected: ${RuntimeIdentityGuard.lastReasonCode() ?: "identity_not_verified"}")
+                    Log.w(TAG, "instance_rejected: ${RuntimeIdentityGuard.lastReasonCode() ?: "identity_not_verified"}")
                     return false
                 }
 
                 val activeClassLoader = classLoader ?: return false
                 val userId = HookUtil.getUserId(activeClassLoader)
                 if (userId == null) {
+                    Log.w(TAG, "account_unavailable: phase=initialization trigger=$reason")
                     show("用户未登录")
                     return false
                 }
@@ -1160,6 +1178,7 @@ class ApplicationHook {
                 val admission = when (val result = AccountSlotRegistry.admitRuntimeUser(userId)) {
                     is AccountSlotAdmission.Denied -> {
                         record(TAG, "execution_gate_denied: ${result.reasonCode} process_role=main")
+                        Log.w(TAG, "execution_gate_denied: ${result.reasonCode} process_role=main account=${AccountSlotRegistry.shortHash(userId)}")
                         destroyHandlerInternal("account_slot_${result.reasonCode}", invalidateSession = true)
                         return false
                     }
@@ -1223,6 +1242,7 @@ class ApplicationHook {
                                 AccountSlotRuntimeConfirmation.Confirmed -> error("unreachable")
                             }
                             record(TAG, "execution_gate_denied: $reasonCode process_role=main")
+                            Log.w(TAG, "execution_gate_denied: $reasonCode process_role=main account=${AccountSlotRegistry.shortHash(userId)}")
                             destroyHandlerInternal("account_slot_$reasonCode", invalidateSession = true)
                             return false
                         }
@@ -1237,6 +1257,7 @@ class ApplicationHook {
                         is AccountSlotExecutionCheck.Allowed -> error("unreachable")
                     }
                     record(TAG, "execution_gate_rejected_before_apply: $reasonCode process_role=main")
+                    Log.w(TAG, "execution_gate_rejected_before_apply: $reasonCode process_role=main account=${AccountSlotRegistry.shortHash(userId)}")
                     destroyHandlerInternal("account_slot_recheck", invalidateSession = true)
                     return false
                 }
@@ -1345,7 +1366,9 @@ class ApplicationHook {
                 )
             }
             record(TAG, "初始化完成，处理持久调度唤醒任务[$launchScheduleId]")
-            val schedule = PersistentScheduleRegistry.get(launchScheduleId)
+            val confirmed = ScheduledTaskRouter.confirmTargetLaunch(launchScheduleId, pendingPersistentLaunchConfirmationAt)
+            pendingPersistentLaunchConfirmationAt = 0L
+            val schedule = if (confirmed) PersistentScheduleRegistry.get(launchScheduleId) else null
             if (schedule != null) {
                 if (ScheduledTaskRouter.fire(context, schedule, "init_ready")) {
                     pendingPersistentLaunchScheduleId = null
@@ -1393,6 +1416,8 @@ class ApplicationHook {
                 pendingInitReason = null
                 rootCheckInProgress = false
                 pendingPersistentLaunchScheduleId = null
+                pendingPersistentLaunchConfirmationAt = 0L
+                pendingPersistentLaunchBatch = false
                 ApplicationHookConstants.clearPendingTriggers(reason)
                 if (invalidateSession) {
                     PersistentScheduleRegistry.clearAll(appContext)
@@ -1475,6 +1500,8 @@ class ApplicationHook {
                         executorStatus is CommandUtil.ServiceStatus.Active &&
                         WorkflowRootGuard.isExecutionAllowed()
                     if (!granted) {
+                        Log.w(TAG, "execution_prerequisites_missing: trigger=$reason executor=${executorStatus.javaClass.simpleName} " +
+                            "account=${currentUid?.let(AccountSlotRegistry::shortHash) ?: "unknown"}")
                         updateRunningStatus("必需权限或使用协议未就绪，已禁止工作流")
                         ApplicationHookConstants.clearPendingTriggers("root_denied")
                         AccountSessionCoordinator.refreshWorkflowState(appContext, "root_denied")
@@ -1516,6 +1543,7 @@ class ApplicationHook {
             pendingInitReason = null
             val message = "必需权限或使用协议未就绪，已禁止工作流"
             record(TAG, "⛔ $message")
+            Log.w(TAG, "execution_prerequisites_missing: legalAccepted=$legalAccepted account=${currentUid?.let(AccountSlotRegistry::shortHash) ?: "unknown"}")
             updateRunningStatus(message)
             ApplicationHookConstants.clearPendingTriggers("execution_prerequisites_missing")
             AccountSessionCoordinator.refreshWorkflowState(appContext, "execution_prerequisites_missing", legalAccepted = legalAccepted)
@@ -1563,6 +1591,10 @@ class ApplicationHook {
             UnifiedScheduler.scheduleLongDelay(20000L, "重新登录") {
                 if (!WorkflowRootGuard.isExecutionAllowed()) {
                     record(TAG, "必需权限或使用协议未就绪，已取消重新登录")
+                    return@scheduleLongDelay
+                }
+                if (ApplicationResumeCoordinator.isHostAppForeground()) {
+                    record(TAG, "目标应用已在前台，等待当前验证完成，跳过重新登录拉起")
                     return@scheduleLongDelay
                 }
                 val ownerUserId = AccountSessionCoordinator.currentUserId() ?: currentUid
